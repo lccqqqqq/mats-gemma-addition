@@ -545,7 +545,7 @@ acts_gemma = cache_gemma["blocks.0.hook_resid_post"].squeeze(1)
 
 plot_pca_projection(10, acts_gemma, msg="Gemma-2-2b")
 
-#%% Do the same for gemma-2-2b, now with 2-digit numbers
+#%% Do the same for gemma-2-2b, now with 3-digit numbers
 numbers = [f"{i:03d}" for i in range(300)]
 tokens = gemma.to_tokens(numbers, prepend_bos=False)
 
@@ -571,12 +571,111 @@ plot_pca_projection(300, acts_gemma_02d, msg="Gemma-2-2b-2d")
 plt.figure()
 plot_fft_analysis(acts_gemma_02d, fraction=0.5, yrange=6000, xrange=300, alpha=0)
 
+#%% 
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 #%% Finding helix
+t.cuda.empty_cache()
+LAYER = 1
+nrange = 100
+T = t.tensor([2, 5, 10, 100])
+
+# Create the target basis vectors
+B = []
+for a in range(nrange):
+    # Create base tensor with the number
+    base = [t.tensor([a])]
+    
+    # Calculate trig components for each period T
+    for period in T:
+        angle = 2*math.pi*a / period
+        trig_components = t.stack([t.cos(angle), t.sin(angle)])
+        base.append(trig_components.flatten())
+    
+    # Combine components for this number
+    B.append(t.cat(base))
+
+# Stack all number representations into final tensor
+B = t.stack(B)
+s(B)
+print(B)
+
+# find the pca of the resid_post of the gpt model
 
 
+numbers = [f"{i}" for i in range(nrange)]
+tokens = gpt.to_tokens(numbers, prepend_bos=False)
+print(tokens)
+_, cache_gpt = gpt.run_with_cache(
+    tokens,
+    stop_at_layer=LAYER+1,
+    names_filter=[
+        f"blocks.{i}.hook_resid_post"
+        for i in range(LAYER)
+    ]
+)
+acts_gpt = cache_gpt["blocks.0.hook_resid_post"]
+acts_gpt.shape
 
+#%% Perform PCA on the activations
+U, S, V = t.pca_lowrank(acts_gpt.squeeze(1).to(t.float32), q=100, niter=2)
+s(U)
+s(S)
+s(V)
 
+#%%
+pca_trunc = 100
+# Perform linear regression between V and B
+# Convert tensors to float32 for numerical stability
+V_float = V.to(t.float32)
+s(V_float)
+s(acts_gpt)
+#%%
+acts_gpt_proj = acts_gpt.squeeze(1).to(t.float32) @ V_float
+B_float = B.to(t.float32).to("cuda:1")
 
+# Solve the linear regression equation: acts_gpt_proj ≈ B @ W
+# Using sklearn's ridge regression with cross-validation
+from sklearn.linear_model import RidgeCV
+from sklearn.preprocessing import StandardScaler
+
+# Convert to numpy for sklearn
+B_np = B_float.cpu().numpy()
+acts_np = acts_gpt_proj.cpu().numpy()
+
+# Standardize features
+scaler = StandardScaler()
+B_scaled = scaler.fit_transform(B_np)
+
+# Fit ridge regression with cross-validation
+alphas = [0.1, 1.0, 10.0]  # Regularization parameters to try
+reg = RidgeCV(alphas=alphas, cv=5)
+reg.fit(B_scaled, acts_np)
+
+# Transform coefficients back to PyTorch tensor and correct for scaling
+C_PCA = t.from_numpy(reg.coef_).to(B_float.device).to(t.float32)
+residuals = t.from_numpy(
+    np.sum((acts_np - reg.predict(B_scaled))**2, axis=0)
+).to(B_float.device)
+
+s(residuals)
+s(C_PCA)
+
+#%%
+# Calculate R-squared score to measure goodness of fit
+acts_gpt_proj_pred = B_float @ C_PCA.transpose(0, 1)
+
+total_ss = ((acts_gpt_proj - acts_gpt_proj.mean(dim=0))**2).sum(dim=0)
+residual_ss = ((acts_gpt_proj - acts_gpt_proj_pred)**2).sum(dim=0)
+r_squared = 1 - (residual_ss/total_ss)
+print(residual_ss)
+print(total_ss)
+
+print(f"R-squared score: {r_squared.mean().item():.4f}")
+print(f"Regression weights shape: {C_PCA.shape}")
+
+#%%
+s(B_float)
+s(acts_gpt_proj)
 
 
 
