@@ -218,7 +218,7 @@ def prompt_generator(
                 )
             elif with_instructions == "instruct":
                 q_list.append(
-                    f"{instr_str}, {a[i].item()} {operation_str if with_symbols else operation} {b[i].item()} {equal_str}"
+                    f"{instr_str}. {a[i].item()} {operation_str if with_symbols else operation} {b[i].item()} {equal_str}"
                 )
             elif with_instructions == "example":
                 q_list.append(
@@ -823,10 +823,33 @@ def generate_patching_instances(
 # TODO: validate that all these instances are correct?
 #%% ACtivation patching: PCA patching
 
+
+#%%
 # start with gpt
 correct_list, corrupt_list = generate_patching_instances(arithm_data[0], gpt, seed=42)
 print(correct_list)
 print(corrupt_list)
+#%% Generate prompt pairs
+nrange = 360
+answers = []
+prompt_pairs = []
+for _ in range(100):
+    a = random.randint(0, nrange)
+    b = random.randint(0, nrange)
+    a_ = random.randint(0, nrange)
+    while a_ == a:
+        a_ = random.randint(0, nrange)
+    prompt_pairs.append(
+        (
+            f"Output ONLY a number. {a} + {b} =",
+            f"Output ONLY a number. {a_} + {b} ="
+        )
+    )
+    answers.append(
+        f"{a + b}"
+    )
+print(prompt_pairs)
+
 
 # %% patching the entire layer
 
@@ -836,36 +859,44 @@ a_cor = corrupt_list[0][0]
 lyr = 1
 
 clean_logits = gpt(
-    q_list[a_cl * 100 + b],
+    arithm_data[0].q_list[a_cl * 100 + b],
     return_type="logits",
 )[:, -1, :] # Only take logits for the last position
 
-def replace_with_corrupt(
+#%%
+print(arithm_data[0].q_list[a_cl * 100 + b])
+
+#%%
+
+def replace_with_clean(
     clean_acts: t.Tensor,
     corrupt_acts: t.Tensor,
 ):
     return corrupt_acts
 
-def get_corrupt_acts(
+def get_clean_acts(
     model: HookedTransformer,
-    corrupted_input: tuple[int, int],
-    layer: int,
-) -> t.Tensor:
+    clean_input: tuple[int, int],
+) -> ActivationCache:
     _, cache = model.run_with_cache(
-        q_list[corrupted_input[0] * 100 + corrupted_input[1]],
-        stop_at_layer=layer,
-        names_filter=[f"blocks.{layer-1}.hook_resid_post"],
+        q_list[clean_input[0] * 100 + clean_input[1]],
+        names_filter=[f"blocks.{layer}.hook_resid_post" for layer in range(model.cfg.n_layers)],
     )
-    return cache[f"blocks.{layer-1}.hook_resid_post"]
+    return cache
 
-
+from functools import partial
 
 corrupt_logits = gpt.run_with_hooks(
     q_list[a_cl * 100 + b],
     fwd_hooks=[
-        
-    ]
-)
+        (
+            f"blocks.{lyr}.hook_resid_post",
+            partial(replace_with_clean, clean_acts=get_clean_acts(gpt, (a_cl, b), lyr)),	
+        )
+    ],
+    return_type="logits",
+)[:, -1, :]
+
 
 
 # %%
