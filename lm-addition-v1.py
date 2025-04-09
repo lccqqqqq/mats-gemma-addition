@@ -12,7 +12,8 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal, TypeAlias
 from torch.cuda import OutOfMemoryError  # Add this import for OOM error handling
-
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 import einops
 import numpy as np
 import pandas as pd
@@ -46,6 +47,7 @@ from transformer_lens import ActivationCache, HookedTransformer
 from transformer_lens.hook_points import HookPoint
 from transformer_lens.utils import get_act_name, test_prompt, to_numpy
 
+t.set_grad_enabled(False)
 # %% Helper functions
 # Outputting tensor shapes and printing GPU memory
 import inspect
@@ -126,24 +128,11 @@ print(f"Gemma model size: {total_params / 1024**3:.2f} GB")
 # Print GPU memory usage after loading gemma
 print_gpu_memory("after loading gemma")
 
-# %% Loading gemma SAEs
-gemma_saes = [
-    SAE.from_pretrained(
-        "gemma-scope-2b-pt-res-canonical",
-        f"layer_{i}/width_16k/canonical",
-        device="cuda:0",
-    )[0]
-    for i in tqdm(range(gemma.cfg.n_layers))
-]
-#%% Set SAE dtypes and release memory on cuda:0
-print_gpu_memory("before trimming")
-gemma_saes = [sae.to(t.bfloat16) for sae in gemma_saes]
-print_gpu_memory("after trimming")
 # %% Loading 6B model
 gpt = HookedTransformer.from_pretrained_no_processing("gpt-j-6b", device="cuda:1", dtype=t.bfloat16)
 print_gpu_memory("after loading gpt")
 #%% Briefly test. The device for gemma-2-2b is cuda:0, and the device for gpt-j-6b is cuda:1
-gpt.to("cuda:1") # for some reason this is necessary even if I have specified the device when loading the model...
+gpt.to("cuda:0") # for some reason this is necessary even if I have specified the device when loading the model...
 
 print(f"gemma device: {gemma.cfg.device}")
 print(f"gpt device: {gpt.cfg.device}")
@@ -272,7 +261,7 @@ class PromptModelConfig:
     model: HookedTransformer = gpt
     n_range: int = 25
     n_batch: int = 100
-    use_grid_search: bool = True
+    use_grid_search: bool = True 
     with_instructions: Literal["none", "instruct", "example"] = "instruct"
     instr_str: str = "Output ONLY a number"
     with_symbols: bool = False
@@ -280,7 +269,14 @@ class PromptModelConfig:
     
 cfgs = [
     PromptModelConfig(
+        model_name="gpt-j-6b",
+        model=gpt,
         n_range=25,
+        use_grid_search=True,
+        with_instructions="instruct",
+        instr_str="Output ONLY a number",
+        max_new_tokens=1,
+        with_symbols=True,
     ),
     PromptModelConfig(
         model_name="gemma-2-2b",
@@ -298,12 +294,12 @@ cfgs = [
 gpt.to("cuda:1").cfg.device
 prompt = "Output ONLY a number, 1 + 4 ="
 gemma.generate(prompt, max_new_tokens=4, do_sample=False)
+print_gpu_memory()
+#%%
+print(gemma.cfg.device)
+print(gpt.cfg.device)
 
-#%% Get performance of both models
-t.cuda.empty_cache()
-print(cfgs[0])
-
-
+#%%
 def compute_batch(
     question_list_batch: list[str],
     answer_list_batch: list[AnsConfig],
@@ -323,6 +319,7 @@ def compute_batch(
 try:
     acc_list = []
     for cfg in cfgs:
+        # cfg.model.to("cuda:0")
         q_list, ans_list = prompt_generator(
             n_range=cfg.n_range,
             op=["plus"],
@@ -361,41 +358,124 @@ try:
         # Calculate accuracy
         accuracy = correct.float().mean()
         print(f"{cfg.model_name} accuracy: {accuracy.item():2%}")
+        # cfg.model.to("cpu")
 except OutOfMemoryError:
     print_gpu_memory()
+    clear_gpu_memory()
     raise
 
-#%%
-print_gpu_memory("after getting performance")
 
+#%% Write a function to get the full colormap by decomposing into minibatches
+
+def get_acc(
+    cfg: PromptModelConfig,
+    n_range: int = 100,
+    minibatch_size: int = 1000,
+) -> list[t.Tensor]:
+    """
+    Get the accuracy of the model on the full range of numbers.
+    """
+    q_list, ans_list = prompt_generator(
+        n_range=n_range,
+        op=["plus"],
+        use_grid_search=cfg.use_grid_search,
+        with_instructions=cfg.with_instructions,
+        instr_str=cfg.instr_str,
+        with_symbols=cfg.with_symbols,
+    )
+    acc_list = []
+    n_batches = len(q_list) // minibatch_size
+    for i in tqdm(range(n_batches), desc="Getting accuracy"):
+        t.cuda.empty_cache()
+        q_list_batch = q_list[i*minibatch_size:(i+1)*minibatch_size]
+        ans_list_batch = ans_list[i*minibatch_size:(i+1)*minibatch_size]
+        # Get the model's output
+        question_tokens_batch = cfg.model.to_tokens(q_list_batch, padding_side="left").to(
+            cfg.model.cfg.device
+        )
+        answer_tokens_batch = cfg.model.generate(
+            question_tokens_batch,
+            max_new_tokens=cfg.max_new_tokens,
+            do_sample=False,
+        ).to(cfg.model.cfg.device)
+        # process the output
+        ans_batch = [
+            answer_tokens_batch[i, -cfg.max_new_tokens:].tolist()
+            for i in range(len(answer_tokens_batch))
+        ]
+        ans_batch = cfg.model.to_string(ans_batch)
+        
+        correct_batch = [
+            str(ans_list_batch[i].ans) in ans_batch[i]
+            for i in range(len(ans_batch))
+        ]
+        correct_batch = t.tensor(correct_batch, device="cpu")
+        acc_list.append(correct_batch)
+        # Calculate accuracy
+        accuracy = correct_batch.float().mean()
+        # print(f"{cfg.model_name} accuracy: {accuracy.item():2%}")
+        # Update tqdm description with current accuracy
+        tqdm.write(f"Batch {i+1}/{n_batches}, Accuracy: {accuracy.item():2%}")
+
+    return q_list, ans_list, acc_list
+
+#%% Processing accuracy
+import matplotlib.pyplot as plt
+
+@dataclass
+class ArithmeticAccuracy:
+    accuracy: float
+    acc_list: t.Tensor
+    q_list: list[str]
+    cfg: PromptModelConfig
+
+arithm_data = []
+for cfg in cfgs:
+    q_list, ans_list, acc_list = get_acc(cfg)
+    acc_list = t.cat(acc_list)
+    arithm_data.append(ArithmeticAccuracy(
+        accuracy=acc_list.float().mean(),
+        acc_list=acc_list,
+        q_list=q_list,
+        cfg=cfg
+    ))
+    tot_acc = acc_list.float().mean()
+    acc_list = acc_list.reshape(100, 100)
+    acc_list = acc_list.float().cpu().numpy()
+    plt.figure()
+    plt.imshow(acc_list, cmap=plt.cm.RdBu_r, vmin=0, vmax=1)
+    plt.colorbar()
+    plt.set_cmap('Blues_r')
+    plt.title(f"{cfg.model_name} accuracy: {tot_acc:.2%}")
+    plt.show()
 #%% Colormap for accuracy
 
 # Create colormaps using plotly
-for i, acc_matrix in enumerate(acc_list):
-    # Convert accuracy matrix to numpy for plotting
-    acc_np = acc_matrix.float().cpu().numpy()
+# for i, acc_matrix in enumerate(acc_list):
+#     # Convert accuracy matrix to numpy for plotting
+#     acc_np = acc_matrix.float().cpu().numpy()
     
-    # Create heatmap
-    fig = go.Figure(data=go.Heatmap(
-        z=acc_np,
-        colorscale=[[0, 'white'], [1, 'skyblue']],  # Skyblue to white colorscale
-        zmin=0,
-        zmax=1,
-        colorbar=dict(
-            ticktext=["Not Correct", "Correct"],
-            tickvals=[0, 1]
-        )
-    ))
+#     # Create heatmap
+#     fig = go.Figure(data=go.Heatmap(
+#         z=acc_np,
+#         colorscale=[[0, 'white'], [1, 'skyblue']],  # Skyblue to white colorscale
+#         zmin=0,
+#         zmax=1,
+#         colorbar=dict(
+#             ticktext=["Not Correct", "Correct"],
+#             tickvals=[0, 1]
+#         )
+#     ))
     
-    # Update layout
-    fig.update_layout(
-        title=f'Accuracy Heatmap for {cfgs[i].model_name}',
-        xaxis_title='First Number',
-        yaxis_title='Second Number',
-        width=430,
-        height=400
-    )
-    fig.show()
+#     # Update layout
+#     fig.update_layout(
+#         title=f'Accuracy Heatmap for {cfgs[i].model_name}',
+#         xaxis_title='First Number',
+#         yaxis_title='Second Number',
+#         width=430,
+#         height=400
+#     )
+#     fig.show()
 
 #%% test
 print(gpt.embed.W_E.shape)
@@ -404,7 +484,7 @@ print(gpt.embed.W_E.shape)
 
 t.cuda.empty_cache()
 t.cuda.reset_peak_memory_stats() # this can release memory that are currently allocated but not used in gpus
-
+gpt.cuda()
 print_gpu_memory("before getting embeddings")
 numbers = [str(i) for i in range(360)]
 tokens = gpt.to_tokens(numbers, prepend_bos=False)
@@ -428,7 +508,7 @@ import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
 
-trunc = 10
+trunc = 100
 
 def plot_pca_projection(trunc, acts, q=1, niter=2, msg="", plot_line=True):
     # Perform PCA
@@ -526,8 +606,9 @@ plot_fft_analysis(acts, fraction=0.5, yrange=2000, xrange=360, alpha=-1)
 
 t.cuda.empty_cache()
 t.cuda.reset_peak_memory_stats()
-
+gemma.cuda()
 print_gpu_memory("before getting embeddings")
+
 numbers = [str(i) for i in range(10)]
 tokens = gemma.to_tokens(numbers, prepend_bos=False)
 stop_layer = 1 # we are only interested in the representations, i.e. the embeddings. We treat the first layer as an extension of the embedding layer.
@@ -573,54 +654,12 @@ plot_fft_analysis(acts_gemma_02d, fraction=0.5, yrange=6000, xrange=300, alpha=0
 
 #%% 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+print_gpu_memory()
+
+
 #%% Finding helix
-t.cuda.empty_cache()
-LAYER = 1
-nrange = 100
-T = t.tensor([2, 5, 10, 100])
-
-# Create the target basis vectors
-B = []
-for a in range(nrange):
-    # Create base tensor with the number
-    base = [t.tensor([a])]
-    
-    # Calculate trig components for each period T
-    for period in T:
-        angle = 2*math.pi*a / period
-        trig_components = t.stack([t.cos(angle), t.sin(angle)])
-        base.append(trig_components.flatten())
-    
-    # Combine components for this number
-    B.append(t.cat(base))
-
-# Stack all number representations into final tensor
-B = t.stack(B)
-s(B)
-print(B)
-
-# find the pca of the resid_post of the gpt model
-
-
-numbers = [f"{i}" for i in range(nrange)]
-tokens = gpt.to_tokens(numbers, prepend_bos=False)
-print(tokens)
-_, cache_gpt = gpt.run_with_cache(
-    tokens,
-    stop_at_layer=LAYER+1,
-    names_filter=[
-        f"blocks.{i}.hook_resid_post"
-        for i in range(LAYER)
-    ]
-)
-acts_gpt = cache_gpt["blocks.0.hook_resid_post"]
-acts_gpt.shape
-
-
-#%% 
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-#%% Finding helix
-clear_gpu_memory()
+# clear_gpu_memory()
 def get_act(nrange, layer, model, model_name):
     if model_name == "gpt":
         numbers = [f"{i}" for i in range(nrange)]
@@ -669,11 +708,11 @@ def find_helix(acts, nrange=100, T=[2,5,10,100], plot=False, linear = True):
     acts_proj = acts.squeeze(1).to(t.float32) @ V_float
 
     # Linear regression
-    B_float = B.to(t.float32).to("cuda:0")
+    B_float = B.to(t.float32).to(acts_proj.device)
     C_PCA, residuals, rank, ss = t.linalg.lstsq(B_float, acts_proj)
     C = C_PCA@V_float.T
-    helix_proj = acts.squeeze(1).to(t.float32)@C.pinverse()
-    acts_pred = B_float@C
+    helix_proj = acts.squeeze(1).to(t.float32) @ C.pinverse()
+    acts_pred = B_float @ C
 
     if plot:
         cols = len(T)
@@ -695,16 +734,19 @@ def find_helix(acts, nrange=100, T=[2,5,10,100], plot=False, linear = True):
         fig_combined.update_layout(height=400, width=1200, showlegend=False)
         fig_combined.show()
     return acts_pred
+
+#%% The helix
 #px.line(t.arange(nrange), helix_proj_[:,0].cpu().numpy())
 acts_gpt = get_act(100, 1, gpt, "gpt")
 find_helix(acts_gpt, nrange=100, T=[2,5,10,100], plot=True, linear=True)
+
 acts_gemma = get_act(100, 1, gemma, "gemma")
 find_helix(acts_gemma, nrange=100, T=[2,5,10,100], plot=True, linear=True)
 
 
 #%%
 acts_gpt_proj = acts_gpt.squeeze(1).to(t.float32) @ V_float
-B_float = B.to(t.float32).to(acts_gpt_proj.device)
+B_float = B.to(t.float32).to("cuda:0")
 
 # Solve the linear regression equation: acts_gpt_proj ≈ B @ W
 # Using sklearn's ridge regression with cross-validation
@@ -751,38 +793,84 @@ s(B_float)
 s(acts_gpt_proj)
 
 
+#%% Activation patching: Generate 100 pairs of random number sums
+
+batch_size = 100
+def generate_patching_instances(
+    arith_acc: ArithmeticAccuracy,
+    model: HookedTransformer,
+    batch_size: int = 100,
+    seed: int | None = None,
+):
+    assert arith_acc.cfg.model == model, "Model mismatch"
+    if seed is not None:
+        t.manual_seed(seed)
+    
+    correct_list = []
+    corrupt_list = []
+    acc_map = arith_acc.acc_list.reshape(100, 100)
+    while len(correct_list) < batch_size:
+        a = t.randint(0, 100, (1,))
+        b = t.randint(0, 100, (1,))
+        a1 = t.randint(0, 100, (1,))
+        # check that the model can solve both correctly
+        if acc_map[a, b] and acc_map[a1, b]:
+            correct_list.append((a, b))
+            corrupt_list.append((a1, b))
+    
+    return correct_list, corrupt_list
+
+# TODO: validate that all these instances are correct?
+#%% ACtivation patching: PCA patching
+
+# start with gpt
+correct_list, corrupt_list = generate_patching_instances(arithm_data[0], gpt, seed=42)
+print(correct_list)
+print(corrupt_list)
+
+# %% patching the entire layer
+
+t.cuda.empty_cache()
+a_cl, b = correct_list[0]
+a_cor = corrupt_list[0][0]
+lyr = 1
+
+clean_logits = gpt(
+    q_list[a_cl * 100 + b],
+    return_type="logits",
+)[:, -1, :] # Only take logits for the last position
+
+def replace_with_corrupt(
+    clean_acts: t.Tensor,
+    corrupt_acts: t.Tensor,
+):
+    return corrupt_acts
+
+def get_corrupt_acts(
+    model: HookedTransformer,
+    corrupted_input: tuple[int, int],
+    layer: int,
+) -> t.Tensor:
+    _, cache = model.run_with_cache(
+        q_list[corrupted_input[0] * 100 + corrupted_input[1]],
+        stop_at_layer=layer,
+        names_filter=[f"blocks.{layer-1}.hook_resid_post"],
+    )
+    return cache[f"blocks.{layer-1}.hook_resid_post"]
 
 
+
+corrupt_logits = gpt.run_with_hooks(
+    q_list[a_cl * 100 + b],
+    fwd_hooks=[
         
+    ]
+)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+# %%
+arith_acc = arithm_data[1]
+print(arith_acc.q_list[43 * 100 + 3])
 
 
 
